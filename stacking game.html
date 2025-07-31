@@ -1,0 +1,1165 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>疊積木遊戲</title>
+    <script type="module">
+        // Firebase SDK imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Tailwind CSS CDN
+        const tailwindScript = document.createElement('script');
+        tailwindScript.src = "https://cdn.tailwindcss.com";
+        document.head.appendChild(tailwindScript);
+
+        // Wait for Tailwind to load if needed, though usually it's fast enough
+        tailwindScript.onload = () => {
+            // All game logic will be inside this onload to ensure DOM and Firebase are ready
+            initializeGameLogic();
+        };
+
+        // Firebase variables
+        let app;
+        let db;
+        let auth;
+        let userId = 'anonymous'; // Default to anonymous until authenticated
+
+        async function initializeFirebase() {
+            try {
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                // Sign in anonymously or with custom token
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                    console.log("Signed in with custom token.");
+                } else {
+                    await signInAnonymously(auth);
+                    console.log("Signed in anonymously.");
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("User ID:", userId);
+                        loadGameData(); // Load data once authenticated
+                    } else {
+                        console.log("No user is signed in.");
+                        // Handle case where user signs out or fails to sign in
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization or authentication error:", error);
+            }
+        }
+
+        // Global variable for customization data (now mutable)
+        let characterCustomizationData = {
+            bodyColors: [
+                { id: 'body_red', name: '紅色衣服', value: '#ff6347', cost: 0, unlocked: true },
+                { id: 'body_blue', name: '藍色衣服', value: '#4682b4', cost: 0, unlocked: true },
+                { id: 'body_green', name: '綠色衣服', value: '#3cb371', cost: 10, unlocked: false },
+                { id: 'body_purple', name: '紫色衣服', value: '#8a2be2', cost: 15, unlocked: false },
+            ],
+            eyeStyles: [
+                { id: 'eyes_dot', name: '點點眼', type: 'dot', cost: 0, unlocked: true },
+                { id: 'eyes_line', name: '直線眼', type: 'line', cost: 0, unlocked: true },
+                { id: 'eyes_wide', name: '大眼睛', type: 'wide', cost: 5, unlocked: false },
+                { id: 'eyes_closed', name: '閉眼', type: 'closed', cost: 8, unlocked: false },
+            ],
+            // Removed accessories category as per user request
+            // accessories: [
+            //     { id: 'acc_none', name: '無飾品', type: 'none', cost: 0, unlocked: true },
+            //     { id: 'acc_cat_ears', name: '貓耳朵', type: 'cat_ears', cost: 15, unlocked: false },
+            //     { id: 'acc_bunny_ears', name: '兔耳朵', type: 'bunny_ears', cost: 20, unlocked: false },
+            // ]
+        };
+
+        // Current selected customization items
+        let currentCustomization = {
+            bodyColor: 'body_red',
+            eyeStyle: 'eyes_dot',
+            accessory: 'acc_none' // Keep this to avoid breaking existing save data, but it will default to 'none'
+        };
+
+        async function loadGameData() {
+            if (!db || !userId) {
+                console.log("Firestore not ready or user not authenticated to load data.");
+                return;
+            }
+            try {
+                const userDocRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/gameData/userData`); // Use a more general doc name
+                onSnapshot(userDocRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        goldCoins = data.goldCoins || 0;
+                        
+                        // Load and merge customization data to handle new items
+                        if (data.characterCustomizationData) {
+                            Object.keys(characterCustomizationData).forEach(categoryKey => {
+                                if (data.characterCustomizationData[categoryKey]) {
+                                    characterCustomizationData[categoryKey].forEach(item => {
+                                        const loadedItem = data.characterCustomizationData[categoryKey].find(loaded => loaded.id === item.id);
+                                        if (loadedItem) {
+                                            item.unlocked = loadedItem.unlocked; // Update unlocked status
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        // Load current selected items, ensure 'accessory' defaults to 'none' if it was a removed item
+                        currentCustomization = data.currentCustomization || currentCustomization;
+                        if (!characterCustomizationData.accessories && currentCustomization.accessory !== 'acc_none') {
+                            currentCustomization.accessory = 'acc_none'; // Force to 'none' if accessories are removed
+                        }
+
+
+                        console.log("Game data loaded:", data);
+                    } else {
+                        console.log("No game data found for user, initializing to default.");
+                        goldCoins = 0;
+                        // characterCustomizationData and currentCustomization are already at their default values
+                        saveGameData(); // Save initial state if no data exists
+                    }
+                    goldCoinsDisplay.textContent = goldCoins;
+                    modalGoldCoinsDisplay.textContent = goldCoins;
+                    renderCustomizationOptions(); // Re-render options based on loaded/updated gold
+                    // Also update character's current appearance based on loaded data
+                    if (character && characterCustomizationData.bodyColors.length > 0) { // Ensure character object exists before updating
+                        character.color = characterCustomizationData.bodyColors.find(item => item.id === currentCustomization.bodyColor).value;
+                    }
+                }, (error) => {
+                    console.error("Error listening to game data:", error);
+                });
+            } catch (error) {
+                console.error("Error loading game data:", error);
+            }
+        }
+
+        async function saveGameData() {
+            if (!db || !userId) {
+                console.log("Firestore not ready or user not authenticated to save data.");
+                return;
+            }
+            try {
+                const userDocRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/gameData/userData`);
+                await setDoc(userDocRef, {
+                    goldCoins: goldCoins,
+                    characterCustomizationData: characterCustomizationData, // Save the entire object
+                    currentCustomization: currentCustomization // Save current selected items
+                }, { merge: true });
+                console.log("Game data saved successfully.");
+            } catch (error) {
+                console.error("Error saving game data:", error);
+            }
+        }
+
+        // Main game logic function, called after Firebase is initialized
+        function initializeGameLogic() {
+            // 獲取 DOM 元素
+            const canvas = document.getElementById('gameCanvas');
+            const ctx = canvas.getContext('2d');
+            const scoreDisplay = document.getElementById('score');
+            const goldCoinsDisplay = document.getElementById('goldCoins');
+            const gameOverOverlay = document.getElementById('gameOverOverlay');
+            const finalScoreDisplay = document.getElementById('finalScore');
+            const restartButton = document.getElementById('restartButton');
+            const characterButton = document.getElementById('characterButton');
+            const characterCustomizationModal = document.getElementById('characterCustomizationModal');
+            const closeModalBtn = document.getElementById('closeModalBtn');
+            const modalGoldCoinsDisplay = document.getElementById('modalGoldCoins');
+            const startScreen = document.getElementById('startScreen');
+            const startButton = document.getElementById('startButton');
+            const gameContainer = document.getElementById('gameContainer');
+
+            // 遊戲常數
+            const GRAVITY = 0.5; // 重力加速度
+            const JUMP_STRENGTH = -10; // 跳躍力量
+            const CHARACTER_SIZE = 40; // 角色大小
+            const BLOCK_HEIGHT = 40; // 積木高度
+            const BLOCK_WIDTH_MIN = 80; // 積木最小寬度
+            const BLOCK_WIDTH_MAX = 150; // 積木最大寬度
+            const SLIDING_SPEED = 3; // 積木水平移動速度
+            const GAME_WIDTH = 600; // 遊戲內部邏輯寬度
+            const GAME_HEIGHT = 400; // 遊戲內部邏輯高度
+            const TABLE_HEIGHT = 20; // 初始桌面高度
+            const BLOCK_SPAWN_MIN_INTERVAL = 3000; // 3 秒
+            const BLOCK_SPAWN_MAX_INTERVAL = 5000; // 5 秒
+            const BLOCK_STOP_X_CENTER = GAME_WIDTH / 2; // 積木停止的中心X座標
+
+            // 遊戲狀態變數
+            let score = 0;
+            let goldCoins = 0; // 金幣 (會從 Firestore 加載)
+            let gameOver = false;
+            let character = {};
+            let groundBlocks = []; // 儲存所有堆疊的積木 (包括初始桌子)
+            let slidingBlock = null; // 正在滑動的積木
+            let blockSpawnTimer = 0; // 積木生成計時器
+            let blockSpawnInterval = 0; // 下一個積木生成的間隔時間
+            let lastFrameTime = 0; // 用於計算 deltaTime
+            let cameraY = 0; // 攝影機的Y軸偏移量，用於螢幕跟隨
+            let lastScoreMilestoneForCoins = 0; // 追蹤上次獲得金幣的分數里程碑
+
+            let animationFrameId = null; // 用於儲存 requestAnimationFrame 的 ID
+
+            // 背景圖片
+            let backgroundImage = new Image();
+            backgroundImage.src = 'https://source.unsplash.com/random/600x800/?sky,clouds'; // 隨機天空雲朵圖片，稍微高一點以便滾動
+            // 如果圖片載入失敗，使用預設背景色
+            backgroundImage.onerror = () => {
+                console.error("背景圖片載入失敗，使用預設顏色。");
+                // 可以選擇在這裡設定一個標誌，讓 draw 函數知道使用純色背景
+            };
+
+
+            // 調整 Canvas 內部繪圖尺寸
+            function resizeCanvas() {
+                canvas.width = GAME_WIDTH;
+                canvas.height = GAME_HEIGHT;
+                // CSS會處理實際顯示尺寸的縮放，所以這裡不再設定style
+            }
+
+            // 角色物件
+            function Character() {
+                this.width = CHARACTER_SIZE;
+                this.height = CHARACTER_SIZE;
+                this.x = (GAME_WIDTH - this.width) / 2; // 角色水平居中
+                this.y = 0; // 初始Y座標，會在initGame中設定到地面
+                this.velocityY = 0;
+                this.isJumping = false;
+                this.isFalling = true; // 角色初始狀態為下落，直到落在地面上
+                this.color = '#ff6347'; // 角色衣服顏色 (番茄紅)
+
+                // 更新角色狀態
+                this.update = function() {
+                    if (gameOver) return;
+
+                    const prevY = this.y; // 儲存上一幀的Y座標，用於判斷是否落地
+
+                    this.velocityY += GRAVITY; // 施加重力
+                    this.y += this.velocityY; // 更新Y座標
+
+                    let effectiveGroundY = GAME_HEIGHT; // 預設地面為畫布底部（但實際上會被積木覆蓋）
+                    let currentGroundObject = null; // 儲存角色當前站立的物體
+
+                    // 遍歷所有已停止的地面積木 (包括初始桌子和已停止的積木)
+                    // 找到角色可能站立的最高地面積木
+                    for (const block of groundBlocks) {
+                        // 檢查水平重疊
+                        if (this.x < block.x + block.width && this.x + this.width > block.x) {
+                            // 檢查角色是否會落在這個積木頂部
+                            // 判斷條件：角色上一幀在積木上方，當前幀或下一幀會接觸積木頂部
+                            // 增加一個小容錯值 (+1) 確保精確落地
+                            if (prevY + this.height <= block.y + 1 && this.y + this.height >= block.y) {
+                                if (block.y < effectiveGroundY) { // 找到最高的有效地面
+                                    effectiveGroundY = block.y;
+                                    currentGroundObject = block;
+                                }
+                            }
+                        }
+                    }
+
+                    // 也檢查正在滑動的積木，如果角色會落在上面
+                    if (slidingBlock && slidingBlock.isSliding) {
+                        if (this.x < slidingBlock.x + slidingBlock.width && this.x + this.width > slidingBlock.x) {
+                            if (prevY + this.height <= slidingBlock.y + 1 && this.y + this.height >= slidingBlock.y) {
+                                if (slidingBlock.y < effectiveGroundY) { // 找到最高的有效地面
+                                    effectiveGroundY = slidingBlock.y;
+                                    currentGroundObject = slidingBlock;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 應用落地邏輯
+                    if (this.y + this.height >= effectiveGroundY) {
+                        this.y = effectiveGroundY - this.height; // 釘在地面上
+                        this.velocityY = 0;
+                        this.isJumping = false;
+                        this.isFalling = false;
+                    } else {
+                        this.isFalling = true;
+                    }
+
+                    // 如果角色站在動態 (滑動中) 的積木上，則隨積木移動
+                    if (currentGroundObject === slidingBlock && slidingBlock && slidingBlock.isSliding) {
+                        this.x = slidingBlock.x + (slidingBlock.width / 2) - (this.width / 2);
+                    } else {
+                        // 否則，角色保持在桌子中心
+                        this.x = (GAME_WIDTH - this.width) / 2;
+                    }
+                };
+
+                // 繪製角色 (簡化女孩形象)
+                this.draw = function() {
+                    // 繪製頭部 (淺膚色圓形)
+                    ctx.fillStyle = '#fdd8c7'; // 淺膚色
+                    ctx.beginPath();
+                    ctx.arc(this.x + this.width / 2, this.y + this.height / 3, this.width / 3, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // 繪製身體 (使用角色主色)
+                    ctx.fillStyle = characterCustomizationData.bodyColors.find(
+                        item => item.id === currentCustomization.bodyColor
+                    ).value;
+                    ctx.fillRect(this.x + this.width / 4, this.y + this.height / 2, this.width / 2, this.height / 2);
+
+                    // 繪製眼睛
+                    ctx.fillStyle = 'black'; // 眼睛顏色
+                    const eyeY = this.y + this.height / 3; // 眼睛的垂直位置
+
+                    switch (currentCustomization.eyeStyle) {
+                        case 'eyes_dot':
+                            ctx.beginPath();
+                            ctx.arc(this.x + this.width / 2 - 8, eyeY, 3, 0, Math.PI * 2); // 左眼
+                            ctx.arc(this.x + this.width / 2 + 8, eyeY, 3, 0, Math.PI * 2); // 右眼
+                            ctx.fill();
+                            break;
+                        case 'eyes_line':
+                            ctx.fillRect(this.x + this.width / 2 - 10, eyeY, 5, 2); // 左眼 (直線)
+                            ctx.fillRect(this.x + this.width / 2 + 5, eyeY, 5, 2); // 右眼 (直線)
+                            break;
+                        case 'eyes_wide':
+                            ctx.beginPath();
+                            ctx.arc(this.x + this.width / 2 - 8, eyeY, 5, 0, Math.PI * 2); // 左眼
+                            ctx.arc(this.x + this.width / 2 + 8, eyeY, 5, 0, Math.PI * 2); // 右眼
+                            ctx.fill();
+                            break;
+                        case 'eyes_closed':
+                            ctx.strokeStyle = 'black'; // 眼睛閉合線條顏色
+                            ctx.lineWidth = 2;
+                            ctx.beginPath();
+                            ctx.moveTo(this.x + this.width / 2 - 10, eyeY);
+                            ctx.lineTo(this.x + this.width / 2 - 5, eyeY + 2);
+                            ctx.stroke(); // 左眼閉合
+                            ctx.beginPath();
+                            ctx.moveTo(this.x + this.width / 2 + 5, eyeY);
+                            ctx.lineTo(this.x + this.width / 2 + 10, eyeY + 2);
+                            ctx.stroke(); // 右眼閉合
+                            ctx.lineWidth = 1; // 重置線條寬度
+                            break;
+                    }
+
+                    // Removed accessory drawing logic as per user request
+                    // ctx.fillStyle = '#a0522d'; // 耳朵顏色 (棕色)
+                    // const headTopY = this.y + this.height / 3 - this.width / 3; // 頭部圓形的頂部
+
+                    // switch (currentCustomization.accessory) {
+                    //     case 'acc_cat_ears':
+                    //         // 左耳
+                    //         ctx.beginPath();
+                    //         ctx.moveTo(this.x + this.width / 2 - 15, headTopY);
+                    //         ctx.lineTo(this.x + this.width / 2 - 5, headTopY - 10);
+                    //         ctx.lineTo(this.x + this.width / 2 - 5, headTopY);
+                    //         ctx.fill();
+                    //         // 右耳
+                    //         ctx.beginPath();
+                    //         ctx.moveTo(this.x + this.width / 2 + 15, headTopY);
+                    //         ctx.lineTo(this.x + this.width / 2 + 5, headTopY - 10);
+                    //         ctx.lineTo(this.x + this.width / 2 + 5, headTopY);
+                    //         ctx.fill();
+                    //         break;
+                    //     case 'acc_bunny_ears':
+                    //         // 左耳
+                    //         ctx.fillRect(this.x + this.width / 2 - 12, headTopY - 20, 5, 20);
+                    //         // 右耳
+                    //         ctx.fillRect(this.x + this.width / 2 + 7, headTopY - 20, 5, 20);
+                    //         break;
+                    // }
+                };
+
+                // 角色跳躍
+                this.jump = function() {
+                    // 只有當角色不在跳躍中且不在下落中 (即在地面上) 才能跳躍
+                    if (!this.isJumping && !this.isFalling && !gameOver) {
+                        this.velocityY = JUMP_STRENGTH;
+                        this.isJumping = true;
+                    }
+                };
+            }
+
+            // 積木物件 (現在只會水平滑動，然後停止)
+            function Block(x, y, width, height) {
+                this.x = x;
+                this.y = y;
+                this.width = width;
+                this.height = height;
+                this.color = `hsl(${Math.random() * 360}, 70%, 60%)`; // 隨機顏色
+                this.velocityX = SLIDING_SPEED; // 恆定水平滑動速度
+                this.isSliding = true; // 標記是否正在滑動
+                this.passedCharacterCenter = false; // 用於得分判斷
+
+                // 更新積木狀態 (只水平移動)
+                this.update = function() {
+                    if (gameOver || !this.isSliding) return; // 如果遊戲結束或積木已停止，則不更新
+
+                    this.x += this.velocityX;
+                };
+
+                // 繪製積木 (增加邊框使其更像積木)
+                this.draw = function() {
+                    ctx.fillStyle = this.color;
+                    ctx.fillRect(this.x, this.y, this.width, this.height);
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)'; // 深色邊框
+                    ctx.lineWidth = 2; // 邊框厚度
+                    ctx.strokeRect(this.x, this.y, this.width, this.height);
+                };
+            }
+
+            // 遊戲初始化
+            function initGame() {
+                score = 0;
+                // goldCoins 不在initGame重置，由 Firestore 加載
+                gameOver = false;
+                scoreDisplay.textContent = score;
+                goldCoinsDisplay.textContent = goldCoins; // 更新金幣顯示
+                gameOverOverlay.classList.add('hidden');
+                cameraY = 0; // 重置攝影機位置
+                lastScoreMilestoneForCoins = 0; // 重置金幣里程碑
+                
+                // 創建初始桌子作為第一個地面積木
+                groundBlocks = [
+                    new Block(0, GAME_HEIGHT - TABLE_HEIGHT, GAME_WIDTH, TABLE_HEIGHT)
+                ];
+                groundBlocks[0].color = '#8B4513'; // 桌子顏色 (棕色)
+                groundBlocks[0].isSliding = false; // 桌子不滑動
+
+                // 初始化角色位置在桌子上
+                character = new Character(); 
+                // 根據當前選中的自訂顏色設定角色衣服顏色
+                if (characterCustomizationData.bodyColors.length > 0) { // 確保有顏色數據
+                    character.color = characterCustomizationData.bodyColors.find(
+                        item => item.id === currentCustomization.bodyColor
+                    ).value;
+                }
+                character.y = groundBlocks[groundBlocks.length - 1].y - character.height;
+
+                // 清除正在滑動的積木
+                slidingBlock = null; 
+                
+                // 立即生成第一個滑動積木
+                generateSlidingBlock(); 
+                // 為下一個積木設定計時器
+                resetBlockSpawnTimer(); 
+
+                // 如果遊戲循環正在運行，先停止它
+                if (animationFrameId) {
+                    cancelAnimationFrame(animationFrameId);
+                }
+                lastFrameTime = 0; // 重置時間
+            }
+
+            // 重置積木生成計時器
+            function resetBlockSpawnTimer() {
+                blockSpawnTimer = 0;
+                // 為後續積木設定隨機間隔
+                blockSpawnInterval = BLOCK_SPAWN_MIN_INTERVAL + Math.random() * (BLOCK_SPAWN_MAX_INTERVAL - BLOCK_SPAWN_MIN_INTERVAL);
+            }
+
+            // 生成新的正在滑動的積木
+            function generateSlidingBlock() {
+                const blockWidth = BLOCK_WIDTH_MIN + Math.random() * (BLOCK_WIDTH_MAX - BLOCK_WIDTH_MIN);
+                // 從畫布左側外開始，Y座標設定為在當前最高積木的頂部
+                slidingBlock = new Block(-blockWidth, groundBlocks[groundBlocks.length - 1].y - BLOCK_HEIGHT, blockWidth, BLOCK_HEIGHT);
+            }
+
+            // 碰撞檢測 (AABB 軸對齊邊界框)
+            function checkCollision(obj1, obj2) {
+                return obj1.x < obj2.x + obj2.width &&
+                       obj1.x + obj1.width > obj2.x &&
+                       obj1.y < obj2.y + obj2.height &&
+                       obj1.y + obj1.height > obj2.y;
+            }
+
+            // 遊戲更新邏輯
+            function update(currentTime) {
+                if (gameOver) {
+                    // 如果遊戲結束，讓角色快速下落以顯示「掉下去」的效果
+                    character.y += character.velocityY; 
+                    character.velocityY += GRAVITY * 2; 
+                    // 如果角色完全掉出畫面，則停止動畫循環
+                    if (character.y > groundBlocks[0].y + GAME_HEIGHT) { // 角色掉到初始地面以下很遠
+                        if (animationFrameId) {
+                            cancelAnimationFrame(animationFrameId);
+                            animationFrameId = null; // 清除 ID
+                        }
+                    }
+                    return; 
+                }
+
+                const deltaTime = currentTime - lastFrameTime; // 毫秒數
+                lastFrameTime = currentTime;
+
+                // 角色更新 (會自動處理地面和積木上的站立)
+                character.update(); 
+
+                // 更新攝影機位置，使螢幕跟隨角色
+                // 讓角色保持在螢幕的垂直中心
+                cameraY = character.y - (GAME_HEIGHT / 2) + (character.height / 2); 
+                // 這裡不設下限，實現無限向上滾動的效果
+
+                // 新增：檢查角色是否掉落出「遊戲世界」
+                // 如果角色掉落到最底層的積木（初始桌子）下方兩倍角色高度，則遊戲結束
+                if (character.y > groundBlocks[0].y + character.height * 2) { 
+                    gameOver = true;
+                    character.color = '#8b0000'; // 撞到後變深紅色
+                    showGameOver();
+                    return; // 遊戲結束，停止更新
+                }
+
+                // 積木生成邏輯：如果沒有正在滑動的積木，則根據計時器生成
+                if (slidingBlock === null) {
+                    blockSpawnTimer += deltaTime; 
+                    if (blockSpawnTimer >= blockSpawnInterval) {
+                        generateSlidingBlock();
+                        resetBlockSpawnTimer(); // 生成後重置計時器，為下一個積木準備
+                    }
+                }
+
+                // 更新正在滑動的積木
+                if (slidingBlock && slidingBlock.isSliding) { 
+                    slidingBlock.update();
+
+                    // 碰撞檢測：
+                    // 如果角色與積木發生碰撞，但不是成功落在積木頂部，則遊戲結束
+                    if (checkCollision(character, slidingBlock)) {
+                        // 判斷角色是否在積木頂端或上方 (有足夠的高度避免被撞)
+                        // 這裡的容錯值可以調整，確保角色能精確落在頂部
+                        const isCharacterOnTopOrAbove = (character.y + character.height <= slidingBlock.y + 5); 
+                        
+                        if (!isCharacterOnTopOrAbove) { // 如果碰撞發生但角色不在積木頂端或上方 (表示撞到側面或下方)
+                            gameOver = true;
+                            character.color = '#8b0000'; // 撞到後變深紅色
+                            showGameOver();
+                            return;
+                        }
+                    }
+
+                    // 判斷積木是否到達中間位置並停止
+                    if (slidingBlock.x + slidingBlock.width / 2 >= BLOCK_STOP_X_CENTER && slidingBlock.isSliding) { 
+                        slidingBlock.x = BLOCK_STOP_X_CENTER - slidingBlock.width / 2; // 釘在中間
+                        slidingBlock.velocityX = 0; // 停止滑動
+                        slidingBlock.isSliding = false; // 標記為已停止
+
+                        // 將停止的積木添加到地面堆疊中
+                        groundBlocks.push(slidingBlock);
+
+                        // 得分邏輯：積木滑到中間，然後女孩角色有跳起來並平安降落，沒有被積木撞到。
+                        // 只要遊戲沒有結束 (表示角色成功避開或站在積木上)，就得分
+                        score += 3; // 每成功處理一個積木得3分
+                        scoreDisplay.textContent = score;
+
+                        // 檢查是否達到金幣獎勵點 (每10分一個金幣)
+                        const currentScoreMilestone = Math.floor(score / 10);
+                        if (currentScoreMilestone > lastScoreMilestoneForCoins) {
+                            const newCoinsEarned = currentScoreMilestone - lastScoreMilestoneForCoins;
+                            goldCoins += newCoinsEarned; 
+                            goldCoinsDisplay.textContent = goldCoins; // 更新金幣顯示
+                            lastScoreMilestoneForCoins = currentScoreMilestone;
+                            saveGameData(); // 保存金幣
+                        }
+                        
+                        slidingBlock = null; // 清除當前滑動積木，準備生成下一個
+                    }
+                }
+            }
+
+            // 繪製遊戲畫面
+            function draw() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height); // 清空畫布
+
+                // 繪製背景圖片 (考慮攝影機偏移量)
+                // 為了實現無限滾動，可以繪製兩張圖片，當一張滾出畫面時，另一張補上
+                const parallaxFactor = 0.5; // 背景移動速度為攝影機的一半，製造視差效果
+                const bgYOffset = (-cameraY * parallaxFactor) % backgroundImage.height;
+
+                // 檢查圖片是否載入完成且有效
+                if (backgroundImage.complete && backgroundImage.naturalHeight !== 0) { 
+                    // 繪製第一張背景
+                    ctx.drawImage(backgroundImage, 0, bgYOffset, GAME_WIDTH, backgroundImage.height);
+                    // 如果第一張背景已經部分滾出畫面，繪製第二張來無縫銜接
+                    if (bgYOffset < 0) {
+                        ctx.drawImage(backgroundImage, 0, bgYOffset + backgroundImage.height, GAME_WIDTH, backgroundImage.height);
+                    }
+                } else {
+                    // 如果圖片未載入或載入失敗，使用預設背景色
+                    ctx.fillStyle = '#add8e6';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                }
+
+                // 繪製所有堆疊的地面積木 (減去攝影機偏移量)
+                groundBlocks.forEach(block => {
+                    ctx.fillStyle = block.color;
+                    ctx.fillRect(block.x, block.y - cameraY, block.width, block.height);
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)'; // 深色邊框
+                    ctx.lineWidth = 2; // 邊框厚度
+                    ctx.strokeRect(block.x, block.y - cameraY, block.width, block.height);
+                });
+
+                // 繪製正在滑動的積木 (減去攝影機偏移量)，只有當它存在時才繪製
+                if (slidingBlock) {
+                    ctx.fillStyle = slidingBlock.color;
+                    ctx.fillRect(slidingBlock.x, slidingBlock.y - cameraY, slidingBlock.width, slidingBlock.height);
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)'; // 深色邊框
+                    ctx.lineWidth = 2; // 邊框厚度
+                    ctx.strokeRect(slidingBlock.x, slidingBlock.y - cameraY, slidingBlock.width, slidingBlock.height);
+                }
+
+                // 繪製角色 (減去攝影機偏移量)
+                // 繪製頭部 (淺膚色圓形)
+                ctx.fillStyle = '#fdd8c7'; // 淺膚色
+                ctx.beginPath();
+                ctx.arc(character.x + character.width / 2, character.y + character.height / 3 - cameraY, character.width / 3, 0, Math.PI * 2);
+                ctx.fill();
+
+                // 繪製身體 (使用角色主色)
+                ctx.fillStyle = characterCustomizationData.bodyColors.find(
+                    item => item.id === currentCustomization.bodyColor
+                ).value;
+                ctx.fillRect(character.x + character.width / 4, character.y + character.height / 2 - cameraY, character.width / 2, character.height / 2);
+
+                // 繪製眼睛
+                ctx.fillStyle = 'black'; // 眼睛顏色
+                const eyeY = character.y + character.height / 3 - cameraY; // 眼睛的垂直位置 (考慮攝影機)
+
+                switch (currentCustomization.eyeStyle) {
+                    case 'eyes_dot':
+                        ctx.beginPath();
+                        ctx.arc(character.x + character.width / 2 - 8, eyeY, 3, 0, Math.PI * 2); // 左眼
+                        ctx.arc(character.x + character.width / 2 + 8, eyeY, 3, 0, Math.PI * 2); // 右眼
+                        ctx.fill();
+                        break;
+                    case 'eyes_line':
+                        ctx.fillRect(character.x + character.width / 2 - 10, eyeY, 5, 2); // 左眼 (直線)
+                        ctx.fillRect(character.x + character.width / 2 + 5, eyeY, 5, 2); // 右眼 (直線)
+                        break;
+                    case 'eyes_wide':
+                        ctx.beginPath();
+                        ctx.arc(character.x + character.width / 2 - 8, eyeY, 5, 0, Math.PI * 2); // 左眼
+                        ctx.arc(character.x + character.width / 2 + 8, eyeY, 5, 0, Math.PI * 2); // 右眼
+                        ctx.fill();
+                        break;
+                    case 'eyes_closed':
+                        ctx.strokeStyle = 'black'; // 眼睛閉合線條顏色
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(character.x + character.width / 2 - 10, eyeY);
+                        ctx.lineTo(character.x + character.width / 2 - 5, eyeY + 2);
+                        ctx.stroke(); // 左眼閉合
+                        ctx.beginPath();
+                        ctx.moveTo(character.x + character.width / 2 + 5, eyeY);
+                        ctx.lineTo(character.x + character.width / 2 + 10, eyeY + 2);
+                        ctx.stroke(); // 右眼閉合
+                        ctx.lineWidth = 1; // 重置線條寬度
+                        break;
+                }
+                // Removed accessory drawing logic as per user request
+            }
+
+            // 遊戲主循環
+            function gameLoop(currentTime) {
+                update(currentTime); 
+                draw();
+
+                if (!gameOver || animationFrameId) { // 只有在遊戲未結束或動畫ID有效時才繼續循環
+                    animationFrameId = requestAnimationFrame(gameLoop);
+                }
+            }
+
+            // 顯示遊戲結束畫面
+            function showGameOver() {
+                finalScoreDisplay.textContent = `你的分數: ${score}`;
+                gameOverOverlay.classList.remove('hidden');
+            }
+
+            // 人物自訂介面相關函數
+            function openCustomizationModal() {
+                characterCustomizationModal.classList.remove('hidden');
+                modalGoldCoinsDisplay.textContent = goldCoins; // 更新模態框中的金幣顯示
+                renderCustomizationOptions(); // 渲染自訂選項
+            }
+
+            function closeCustomizationModal() {
+                characterCustomizationModal.classList.add('hidden');
+            }
+
+            function renderCustomizationOptions() {
+                const bodyColorsContainer = document.getElementById('bodyColorsContainer');
+                const eyeStylesContainer = document.getElementById('eyeStylesContainer');
+                // const accessoriesContainer = document.getElementById('accessoriesContainer'); // Removed
+
+                bodyColorsContainer.innerHTML = '';
+                eyeStylesContainer.innerHTML = '';
+                // accessoriesContainer.innerHTML = ''; // Removed
+
+                // 渲染衣服顏色選項
+                characterCustomizationData.bodyColors.forEach(item => {
+                    const button = document.createElement('button');
+                    button.className = `customization-option-button ${currentCustomization.bodyColor === item.id ? 'selected' : ''}`;
+                    button.style.backgroundColor = item.value;
+                    
+                    if (item.cost > 0 && !item.unlocked) {
+                        button.innerHTML = `<span class="cost-tag">${item.cost}💰</span>`;
+                        if (goldCoins < item.cost) {
+                            button.classList.add('not-enough-coins');
+                        }
+                    } else if (item.unlocked && item.cost > 0) {
+                        button.innerHTML = `<span class="cost-tag unlocked">✔</span>`; // 解鎖後顯示勾
+                    }
+                    button.onclick = (e) => handleCustomizationClick('bodyColor', item.id, e);
+                    bodyColorsContainer.appendChild(button);
+                });
+
+                // 渲染眼睛樣式選項
+                characterCustomizationData.eyeStyles.forEach(item => {
+                    const button = document.createElement('button');
+                    button.className = `customization-option-button ${currentCustomization.eyeStyle === item.id ? 'selected' : ''}`;
+                    button.textContent = getEyeStyleEmoji(item.type); // 使用 Helper 函數獲取 Emoji
+                    
+                    if (item.cost > 0 && !item.unlocked) {
+                        button.innerHTML += `<span class="cost-tag">${item.cost}💰</span>`;
+                        if (goldCoins < item.cost) {
+                            button.classList.add('not-enough-coins');
+                        }
+                    } else if (item.unlocked && item.cost > 0) {
+                        button.innerHTML += `<span class="cost-tag unlocked">✔</span>`;
+                    }
+                    button.onclick = (e) => handleCustomizationClick('eyeStyle', item.id, e);
+                    eyeStylesContainer.appendChild(button);
+                });
+
+                // Removed rendering of accessory options as per user request
+                // characterCustomizationData.accessories.forEach(item => {
+                //     const button = document.createElement('button');
+                //     button.className = `customization-option-button ${currentCustomization.accessory === item.id ? 'selected' : ''}`;
+                //     button.textContent = getAccessoryEmoji(item.type); // 使用 Helper 函數獲取 Emoji
+                    
+                //     if (item.cost > 0 && !item.unlocked) {
+                //         button.innerHTML += `<span class="cost-tag">${item.cost}💰</span>`;
+                //         if (goldCoins < item.cost) {
+                //             button.classList.add('not-enough-coins');
+                //         }
+                //     } else if (item.unlocked && item.cost > 0) {
+                //         button.innerHTML += `<span class="cost-tag unlocked">✔</span>`;
+                //     }
+                //     button.onclick = (e) => handleCustomizationClick('accessory', item.id, e);
+                //     accessoriesContainer.appendChild(button);
+                // });
+            }
+
+            // 獲取眼睛樣式的 Emoji 表示
+            function getEyeStyleEmoji(type) {
+                switch (type) {
+                    case 'dot': return '⚫⚫';
+                    case 'line': return '➖➖';
+                    case 'wide': return '👁️👁️';
+                    case 'closed': return '〰️〰️';
+                    default: return '';
+                }
+            }
+
+            // Removed getAccessoryEmoji function as per user request
+            // 獲取飾品的 Emoji 表示
+            // function getAccessoryEmoji(type) {
+            //     switch (type) {
+            //         case 'none': return '🚫';
+            //         case 'cat_ears': return '🐱'; // 使用貓咪 Emoji 代表貓耳朵
+            //         case 'bunny_ears': return '🐰'; // 使用兔子 Emoji 代表兔耳朵
+            //         default: return '';
+            //     }
+            // }
+
+            // 處理自訂選項點擊事件
+            function handleCustomizationClick(type, itemId, event) {
+                console.log(`Clicked ${type}: ${itemId}`);
+                const category = characterCustomizationData[type + 's']; // 例如：bodyColors
+                const item = category.find(i => i.id === itemId);
+
+                if (!item) {
+                    console.error("Item not found:", itemId);
+                    return;
+                }
+
+                console.log("Item status (before check):", item);
+                console.log("Current gold (before check):", goldCoins);
+                console.log("Item cost:", item.cost);
+
+                if (item.unlocked) {
+                    console.log("Item is already unlocked. Changing selection.");
+                    currentCustomization[type] = itemId;
+                    // 如果是衣服顏色，立即更新角色顏色
+                    if (type === 'bodyColor') {
+                        character.color = item.value;
+                    }
+                    saveGameData(); // 保存當前選擇
+                    renderCustomizationOptions(); // 重新渲染以更新選中邊框
+                } else {
+                    console.log("Item is locked. Attempting to purchase.");
+                    // 嘗試購買
+                    if (goldCoins >= item.cost) {
+                        console.log(`Purchasing ${item.name} for ${item.cost} gold. Remaining gold: ${goldCoins - item.cost}`);
+                        goldCoins -= item.cost;
+                        item.unlocked = true; // Mark as unlocked in data
+                        currentCustomization[type] = itemId;
+                        if (type === 'bodyColor') {
+                            character.color = item.value;
+                        }
+                        goldCoinsDisplay.textContent = goldCoins; // 更新主遊戲金幣顯示
+                        modalGoldCoinsDisplay.textContent = goldCoins; // 更新模態框金幣顯示
+                        saveGameData(); // 保存金幣和解鎖狀態
+                        renderCustomizationOptions(); // 重新渲染以更新解鎖狀態
+                    } else {
+                        console.log(`金幣不足！ 需要 ${item.cost}, 只有 ${goldCoins}`);
+                        // 可以添加一個短暫的視覺提示，例如按鈕變紅
+                        const clickedButton = event.currentTarget;
+                        clickedButton.style.backgroundColor = '#ef4444'; // 暫時變紅
+                        setTimeout(() => {
+                            clickedButton.style.backgroundColor = ''; // 恢復原色
+                        }, 300);
+                    }
+                }
+            }
+
+            // 事件監聽器
+            // 滑鼠點擊 (左鍵或右鍵)
+            canvas.addEventListener('mousedown', (e) => {
+                // 檢查是否為左鍵點擊 (e.button === 0) 或右鍵點擊 (e.button === 2)
+                if (e.button === 0 || e.button === 2) {
+                    character.jump();
+                }
+                e.preventDefault(); // 防止右鍵菜單彈出
+            });
+            // 禁用右鍵菜單
+            canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+            // 觸控點擊
+            canvas.addEventListener('touchstart', (e) => {
+                character.jump();
+                e.preventDefault(); // 防止滾動或縮放
+            }, { passive: false }); // 使用 passive: false 確保 preventDefault 有效
+
+            // 重新開始按鈕點擊
+            restartButton.addEventListener('click', () => {
+                initGame();
+                gameLoop(); // 重新啟動遊戲循環
+            });
+
+            // 人物按鈕點擊
+            characterButton.addEventListener('click', openCustomizationModal);
+            closeModalBtn.addEventListener('click', closeCustomizationModal);
+            startButton.addEventListener('click', () => {
+                startScreen.classList.add('hidden'); // 隱藏開始畫面
+                gameContainer.classList.remove('hidden'); // 顯示遊戲容器
+                initGame(); // 初始化遊戲狀態
+                gameLoop(); // 啟動遊戲循環
+            });
+
+            // 窗口大小改變時調整 Canvas
+            window.addEventListener('resize', resizeCanvas);
+
+            // 遊戲啟動
+            window.onload = function() {
+                // 初始顯示開始畫面，隱藏遊戲畫面
+                startScreen.classList.remove('hidden');
+                gameContainer.classList.add('hidden');
+                resizeCanvas(); // 初始調整 Canvas 尺寸
+                initializeFirebase(); // 初始化 Firebase
+            };
+        }
+    </script>
+    <style>
+        /* CSS 樣式與之前版本相同，確保外觀一致 */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f0f0;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 0;
+            overflow: hidden;
+        }
+        .game-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background-color: #fff;
+            border-radius: 16px;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.25);
+            position: relative;
+            width: 90vw;
+            height: 90vh;
+            max-width: 900px;
+            max-height: 600px;
+            justify-content: center;
+        }
+        canvas {
+            background-color: #add8e6; /* Fallback color if image fails to load */
+            border: 4px solid #333;
+            border-radius: 12px;
+            display: block;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+            touch-action: manipulation;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .score-board {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #333;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+            display: flex;
+            gap: 20px;
+        }
+        .game-over-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 3rem;
+            font-weight: bold;
+            text-align: center;
+            border-radius: 12px;
+            z-index: 10;
+            animation: fadeIn 0.5s ease-out forwards;
+        }
+        .game-over-message {
+            margin-bottom: 15px;
+            font-size: 3.5rem;
+            color: #ff4d4d;
+            text-shadow: 0 0 10px rgba(255, 0, 0, 0.8);
+            animation: pulse 1.5s infinite alternate;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes pulse {
+            from { transform: scale(1); }
+            to { transform: scale(1.05); }
+        }
+
+        .game-over-overlay button {
+            margin-top: 20px;
+            padding: 15px 30px;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: white;
+            background: linear-gradient(145deg, #4CAF50, #45a049);
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s ease;
+        }
+        .game-over-overlay button:hover {
+            background: linear-gradient(145deg, #45a049, #3e8e41);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+        }
+        .game-over-overlay button:active {
+            transform: translateY(0);
+            box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
+        }
+        .hidden {
+            display: none !important;
+        }
+
+        .customization-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.75);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 20;
+        }
+        .customization-content {
+            background-color: #fff;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+            width: 90%;
+            max-width: 500px;
+            position: relative;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .customization-content h2 {
+            font-size: 2rem;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        .customization-content h3 {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #555;
+        }
+        .customization-options-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        .customization-option-button {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            border: 3px solid transparent;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            position: relative;
+            font-size: 2rem;
+        }
+        .customization-option-button.selected {
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.5);
+        }
+        .customization-option-button:hover:not(.selected) {
+            border-color: #9ca3af;
+        }
+        .cost-tag {
+            position: absolute;
+            bottom: -5px;
+            right: -5px;
+            background-color: #ef4444;
+            color: white;
+            font-size: 0.75rem;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 9999px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+        .cost-tag.unlocked {
+            background-color: #22c55e;
+        }
+        .not-enough-coins {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .start-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #add8e6;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 30;
+            color: #333;
+            font-size: 2.5rem;
+            font-weight: bold;
+        }
+        .start-screen h1 {
+            margin-bottom: 40px;
+            font-size: 4rem;
+            color: #4CAF50;
+            text-shadow: 3px 3px 6px rgba(0,0,0,0.2);
+        }
+        .start-screen button {
+            padding: 20px 40px;
+            font-size: 2rem;
+            font-weight: bold;
+            color: white;
+            background: linear-gradient(145deg, #4CAF50, #3e8e41);
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s ease;
+        }
+        .start-screen button:hover {
+            background: linear-gradient(145deg, #3e8e41, #367c39);
+            transform: translateY(-5px);
+            box-shadow: 0 12px 25px rgba(0, 0, 0, 0.4);
+        }
+    </style>
+</head>
+<body>
+    <!-- Start Screen -->
+    <div id="startScreen" class="start-screen">
+        <h1>疊積木遊戲</h1>
+        <button id="startButton">開始遊戲</button>
+    </div>
+
+    <!-- Game Container (Initially Hidden) -->
+    <div id="gameContainer" class="game-container hidden">
+        <div class="score-board">
+            <div>得分: <span id="score">0</span></div>
+            <div>金幣: <span id="goldCoins">0</span></div>
+        </div>
+        <canvas id="gameCanvas"></canvas>
+        <div id="gameOverOverlay" class="game-over-overlay hidden">
+            <div class="game-over-message">遊戲結束！</div>
+            <div id="finalScore"></div>
+            <button id="restartButton">重新開始</button>
+        </div>
+
+        <button id="characterButton" class="absolute bottom-4 left-4 p-3 bg-blue-500 text-white rounded-full shadow-lg hover:bg-blue-600 transition-colors duration-200 z-10">
+            人物
+        </button>
+
+        <!-- Character Customization Modal -->
+        <div id="characterCustomizationModal" class="customization-modal hidden">
+            <div class="customization-content">
+                <button id="closeModalBtn" class="absolute top-3 right-3 text-gray-600 hover:text-gray-900 text-2xl font-bold">&times;</button>
+                <h2>自訂角色</h2>
+                <div class="mb-4 text-lg font-semibold text-center">
+                    你的金幣: <span id="modalGoldCoins" class="text-yellow-600">0</span>
+                </div>
+
+                <div class="mb-6">
+                    <h3>衣服顏色</h3>
+                    <div id="bodyColorsContainer" class="customization-options-container">
+                        <!-- Color options will be injected here -->
+                    </div>
+                </div>
+
+                <div class="mb-6">
+                    <h3>眼睛樣式</h3>
+                    <div id="eyeStylesContainer" class="customization-options-container">
+                        <!-- Eye style options will be injected here -->
+                    </div>
+                </div>
+
+                <!-- Removed accessories section as per user request -->
+                <!-- <div class="mb-6">
+                    <h3>飾品 (耳朵等)</h3>
+                    <div id="accessoriesContainer" class="customization-options-container">
+                    </div>
+                </div> -->
+            </div>
+        </div>
+    </div>
+</body>
+</html>
